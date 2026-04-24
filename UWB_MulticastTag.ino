@@ -2,17 +2,15 @@
  * UWB_MulticastTag.ino
  *
  * Platform : Arduino Stella (Truesense DCU040 / nRF52840)
- * Library  : StellaUWB
- *            https://github.com/Truesense-it/StellaUWB
+ * Library  : StellaUWB, ArduinoBLE
  *
- * Role     : Multicast Responder / Controlee — this tag joins four
- *            multicast sessions (one per anchor) to get TWR distance
- *            measurements from all anchors simultaneously.
+ * Role     : Multicast Responder / Controlee — joins four multicast
+ *            sessions (one per anchor), computes 2D position via
+ *            multilateration, and broadcasts the result over BLE
+ *            advertising.
  *
  * ── CONFIGURATION ──────────────────────────────────────────────────
- *   Change ONLY the TAG_ID below (1 – 12).
- *   Everything else — MAC address, group assignment, session IDs,
- *   anchor addresses — is derived automatically.
+ *   Change ONLY the defines in the "CHANGE THESE" section below.
  *
  * ── ADDRESSING SCHEME ──────────────────────────────────────────────
  *   Tag    MAC      : { 0x00, TAG_ID }
@@ -22,12 +20,13 @@
  *     Tags  7–12 → Group 1
  *   Session ID      : ANCHOR_ID * 100 + GROUP_INDEX + 1
  *
- *   Example for TAG_ID = 9 (Group 1):
- *     Tag MAC   = {0x00, 0x09}
- *     Joins session 2   with Anchor 0  (MAC {0xA0, 0x00})
- *     Joins session 102 with Anchor 1  (MAC {0xA0, 0x01})
- *     Joins session 202 with Anchor 2  (MAC {0xA0, 0x02})
- *     Joins session 302 with Anchor 3  (MAC {0xA0, 0x03})
+ * ── BLE ADVERTISING FORMAT ─────────────────────────────────────────
+ *   Local name : "UWB-T<id>"
+ *   Manufacturer data (7 bytes):
+ *     [0..1] Company ID 0xFFFF (little-endian, BLE SIG test/dev)
+ *     [2]    TAG_ID
+ *     [3..4] x position in cm (int16, little-endian)
+ *     [5..6] y position in cm (int16, little-endian)
  *
  * ── SESSION BUDGET ─────────────────────────────────────────────────
  *   4 sessions per tag     (limit: 5 on DCU040)  ✔
@@ -36,46 +35,156 @@
  */
 
 #include "StellaUWB.h"
+#include <ArduinoBLE.h>
+#include <math.h>
 
-// ===================== CHANGE THIS ================================
-#define TAG_ID          2        // 1 through 12
-// ==================================================================
+// ===================== CHANGE THESE ==================================
+#define TAG_ID            1        // 1 through 12
+
+// Anchor positions (cm) — 10 ft × 10 ft square, corners
+//                        A0        A1        A2        A3
+#define ANCHOR_X  {   0.0f, 305.0f, 305.0f,   0.0f }
+#define ANCHOR_Y  {   0.0f,   0.0f, 305.0f, 305.0f }
+
+// Heights (cm): anchor antenna ~10 in, tag ~2 in
+#define ANCHOR_HEIGHT_CM  25.0f
+#define TAG_HEIGHT_CM      5.0f
+// =====================================================================
 
 #define NUM_ANCHORS     4
 #define TAGS_PER_GROUP  6
+#define GROUP_INDEX     (((TAG_ID) - 1) / TAGS_PER_GROUP)
 
-// Derived constants
-#define GROUP_INDEX     (((TAG_ID) - 1) / TAGS_PER_GROUP)   // 0 or 1
+// UWB ranging resolution
+#define POSITION_RES_CM   10
+#define STALE_TIMEOUT_MS  2500
 
-// File-static, heap-allocated session objects — survive beyond setup()
+static const float anchorX[NUM_ANCHORS] = ANCHOR_X;
+static const float anchorY[NUM_ANCHORS] = ANCHOR_Y;
+
+// ── State ────────────────────────────────────────────────────────
+
 static MulticastResponder* sessions[NUM_ANCHORS] = { nullptr };
 
-// Per-anchor range storage for serial output
 struct AnchorRange {
   float    distance_cm;
   bool     valid;
   uint32_t timestamp;
 };
 
-AnchorRange ranges[NUM_ANCHORS];
+static AnchorRange ranges[NUM_ANCHORS];
 
-// ---------- Ranging callback -------------------------------------
+static int16_t posX_cm   = 0;
+static int16_t posY_cm   = 0;
+static bool    posValid  = false;
+static int16_t prevBleX  = INT16_MIN;
+static int16_t prevBleY  = INT16_MIN;
+
+// ── Height-corrected horizontal distance ─────────────────────────
+
+static float horizontalDistance(float slant_cm) {
+  float dz = ANCHOR_HEIGHT_CM - TAG_HEIGHT_CM;
+  float sq = slant_cm * slant_cm - dz * dz;
+  return (sq > 0.0f) ? sqrtf(sq) : 0.0f;
+}
+
+// ── 2D multilateration (linearized least-squares) ────────────────
 //
-// Fired by the UWB stack when a multicast ranging round produces a
-// result.  We use the session handle to figure out which anchor
-// the measurement came from.
-//
+// Subtracts the first valid anchor's equation from the rest to
+// eliminate the quadratic term, then solves the overdetermined
+// 2×2 system via normal equations (A^T A)^-1 A^T b.
+
+static bool computePosition(float* outX, float* outY) {
+  int   vi[NUM_ANCHORS];
+  float hd[NUM_ANCHORS];
+  int   n = 0;
+
+  for (int a = 0; a < NUM_ANCHORS; a++) {
+    if (ranges[a].valid) {
+      vi[n] = a;
+      hd[n] = horizontalDistance(ranges[a].distance_cm);
+      n++;
+    }
+  }
+
+  if (n < 3) return false;
+
+  int   ref  = vi[0];
+  float x0   = anchorX[ref];
+  float y0   = anchorY[ref];
+  float d0sq = hd[0] * hd[0];
+
+  float ata00 = 0, ata01 = 0, ata11 = 0;
+  float atb0  = 0, atb1  = 0;
+
+  for (int i = 1; i < n; i++) {
+    int   idx = vi[i];
+    float ax  = 2.0f * (anchorX[idx] - x0);
+    float ay  = 2.0f * (anchorY[idx] - y0);
+    float bi  = (anchorX[idx] * anchorX[idx] - x0 * x0)
+              + (anchorY[idx] * anchorY[idx] - y0 * y0)
+              - (hd[i] * hd[i] - d0sq);
+
+    ata00 += ax * ax;
+    ata01 += ax * ay;
+    ata11 += ay * ay;
+    atb0  += ax * bi;
+    atb1  += ay * bi;
+  }
+
+  float det = ata00 * ata11 - ata01 * ata01;
+  if (fabsf(det) < 1e-6f) return false;
+
+  float inv = 1.0f / det;
+  *outX = ( ata11 * atb0 - ata01 * atb1) * inv;
+  *outY = (ata00 * atb1 - ata01 * atb0) * inv;
+  return true;
+}
+
+static int16_t roundToRes(float v) {
+  return (int16_t)(roundf(v / POSITION_RES_CM) * POSITION_RES_CM);
+}
+
+// ── BLE advertising ──────────────────────────────────────────────
+
+static void updateBLEAdvertising() {
+  if (posX_cm == prevBleX && posY_cm == prevBleY)
+    return;
+
+  BLE.stopAdvertise();
+
+  uint8_t mfgData[7];
+  mfgData[0] = 0xFF;
+  mfgData[1] = 0xFF;
+  mfgData[2] = (uint8_t)TAG_ID;
+  mfgData[3] = (uint8_t)(posX_cm & 0xFF);
+  mfgData[4] = (uint8_t)((posX_cm >> 8) & 0xFF);
+  mfgData[5] = (uint8_t)(posY_cm & 0xFF);
+  mfgData[6] = (uint8_t)((posY_cm >> 8) & 0xFF);
+
+  BLEAdvertisingData advData;
+  advData.setManufacturerData(mfgData, sizeof(mfgData));
+
+  char name[16];
+  snprintf(name, sizeof(name), "UWB-T%d", TAG_ID);
+  advData.setLocalName(name);
+
+  BLE.setAdvertisingData(advData);
+  BLE.advertise();
+
+  prevBleX = posX_cm;
+  prevBleY = posY_cm;
+}
+
+// ── Ranging callback ─────────────────────────────────────────────
+
 void rangingHandler(UWBRangingData &rangingData) {
   if (rangingData.measureType() != (uint8_t)uwb::MeasurementType::TWO_WAY)
     return;
 
   uint32_t sessionHandle = rangingData.sessionHandle();
-
-  // Reverse the session-ID formula to get anchor index
-  // sessionId = anchorId * 100 + groupIndex + 1
   int anchorId = (int)(sessionHandle / 100);
 
-  // Bounds check
   if (anchorId < 0 || anchorId >= NUM_ANCHORS)
     return;
 
@@ -90,15 +199,24 @@ void rangingHandler(UWBRangingData &rangingData) {
   }
 }
 
-// ---------- Setup ------------------------------------------------
+// ── Setup ────────────────────────────────────────────────────────
+
 void setup() {
   Serial.begin(115200);
 
-  // ── Tag MAC address ──
+  if (!BLE.begin()) {
+    Serial.println("BLE: init failed!");
+  } else {
+    char name[16];
+    snprintf(name, sizeof(name), "UWB-T%d", TAG_ID);
+    BLE.setLocalName(name);
+    Serial.print("BLE: advertising as ");
+    Serial.println(name);
+  }
+
   uint8_t tagAddrBytes[] = { 0x00, (uint8_t)TAG_ID };
   UWBMacAddress tagMac(UWBMacAddress::Size::SHORT, tagAddrBytes);
 
-  // Register callback before starting the stack
   UWB.registerRangingCallback(rangingHandler);
 
   UWB.begin();
@@ -111,6 +229,7 @@ void setup() {
   Serial.print(TAG_ID, HEX);
   Serial.print("}  Group ");
   Serial.println(GROUP_INDEX);
+  Serial.println("  2D multilateration + BLE position adv");
   Serial.println("=========================================");
   Serial.println("Waiting for UWB stack ...");
 
@@ -119,32 +238,26 @@ void setup() {
 
   Serial.println("UWB stack ready.");
 
-  // Initialize range storage
   for (int a = 0; a < NUM_ANCHORS; a++) {
     ranges[a].distance_cm = 0;
     ranges[a].valid       = false;
     ranges[a].timestamp   = 0;
   }
 
-  // ── Join one multicast session per anchor ──
   for (int a = 0; a < NUM_ANCHORS; a++) {
-
-    // Anchor MAC for this session
     uint8_t anchorAddrBytes[] = { 0xA0, (uint8_t)a };
     UWBMacAddress anchorMac(UWBMacAddress::Size::SHORT, anchorAddrBytes);
 
-    // Session ID must match the anchor's formula exactly
     uint32_t sessionId = (uint32_t)(a * 100 + GROUP_INDEX + 1);
 
     Serial.print("  Joining session ");
     Serial.print(sessionId);
-    Serial.print("  →  Anchor A");
+    Serial.print("  ->  Anchor A");
     Serial.print(a);
     Serial.print("  (MAC {0xA0, 0x0");
     Serial.print(a);
     Serial.println("})");
 
-    // Heap-allocate so the object outlives setup()
     sessions[a] = new MulticastResponder(sessionId, tagMac, anchorMac);
 
     UWBSessionManager.addSession(*sessions[a]);
@@ -160,20 +273,26 @@ void setup() {
   Serial.println("-----------------------------------------");
 }
 
-// ---------- Loop: periodic range report --------------------------
-//
-// Prints a compact line showing distances to all 4 anchors.
-// Format: T1 | A0=123cm  A1=089cm  A2=---  A3=210cm  [3/4]
-//
+// ── Loop ─────────────────────────────────────────────────────────
+
 void loop() {
-  // Invalidate stale readings (>500 ms old)
+  BLE.poll();
+
   for (int a = 0; a < NUM_ANCHORS; a++) {
-    if (ranges[a].valid && (millis() - ranges[a].timestamp > 2500)) {
+    if (ranges[a].valid && (millis() - ranges[a].timestamp > STALE_TIMEOUT_MS))
       ranges[a].valid = false;
-    }
   }
 
-  // Print range report
+  float x, y;
+  if (computePosition(&x, &y)) {
+    posX_cm  = roundToRes(x);
+    posY_cm  = roundToRes(y);
+    posValid = true;
+    updateBLEAdvertising();
+  } else {
+    posValid = false;
+  }
+
   Serial.print("T");
   Serial.print(TAG_ID);
   Serial.print(" | ");
@@ -195,7 +314,17 @@ void loop() {
 
   Serial.print("  [");
   Serial.print(validCount);
-  Serial.println("/4]");
+  Serial.print("/4]");
+
+  if (posValid) {
+    Serial.print("  pos=(");
+    Serial.print(posX_cm);
+    Serial.print(",");
+    Serial.print(posY_cm);
+    Serial.print(")cm");
+  }
+
+  Serial.println();
 
   delay(10);
 }
