@@ -33,18 +33,23 @@ The tag computes its own 2D position using **linearized least-squares multilater
 ```
      A3 (0,305)                          A2 (305,305)
       o─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─o
-      |  ╲                             ╱   |
-      |    ╲  d3                   d2 ╱    |
-      |      ╲                     ╱       |
-      |        ╲                 ╱         |
-      |          ╲             ╱           |
-      |            ╲    T    ╱             |
-      |              ╲  *  ╱               |
-      |            d0  ╲╱  d1              |
-      |              ╱    ╲                |
-      |            ╱        ╲              |
-      |          ╱            ╲            |
-      o─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─o
+      |  ╲                             ╱ |
+      |    ╲  d3                   d2 ╱  |
+      |      ╲                     ╱     |
+      |        ╲                 ╱       |
+      |          ╲             ╱         |
+      |            ╲    T    ╱           |
+      |              ╲  *  ╱             |
+      |                ╲╱                |
+      |              ╱    ╲              |
+      |            ╱        ╲            |
+      |       d0 ╱            ╲ d1       |
+      |        /                \        |
+      |      ╱                    ╲      |
+      |    ╱                        ╲    |
+      |  ╱                            ╲  |
+      |/                                \|
+      o─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ o
      A0 (0,0)                            A1 (305,0)
 
      Each anchor measures slant distance dᵢ to the tag.
