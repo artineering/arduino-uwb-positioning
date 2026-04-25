@@ -30,6 +30,29 @@ Tags are split into two groups:
 
 The tag computes its own 2D position using **linearized least-squares multilateration**.
 
+```
+     A3 (0,305)                          A2 (305,305)
+      o─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─o
+      |  ╲                             ╱   |
+      |    ╲  d3                   d2 ╱    |
+      |      ╲                     ╱       |
+      |        ╲                 ╱         |
+      |          ╲             ╱           |
+      |            ╲    T    ╱             |
+      |              ╲  *  ╱               |
+      |            d0  ╲╱  d1              |
+      |              ╱    ╲                |
+      |            ╱        ╲              |
+      |          ╱            ╲            |
+      o─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─o
+     A0 (0,0)                            A1 (305,0)
+
+     Each anchor measures slant distance dᵢ to the tag.
+     The intersection of the 4 circles gives the tag position.
+     Least-squares finds the best fit when circles don't
+     intersect perfectly due to measurement noise.
+```
+
 ### How it works
 
 Each anchor *i* at known position (xᵢ, yᵢ) gives a circle equation from the measured horizontal distance dᵢ:
@@ -51,7 +74,18 @@ With 4 anchors this produces 3 linear equations for 2 unknowns (an overdetermine
 Before multilateration, slant ranges are projected onto the ground plane:
 
 ```
-d_horizontal = √(d_slant² - Δz²)
+       Anchor (25 cm)
+         o
+         |╲
+   Δz    | ╲  d_slant (measured by UWB)
+  20 cm  |  ╲
+         |   ╲
+  ·──────+────*── ground plane
+              Tag (5 cm)
+         |←─────→|
+         d_horizontal (used for 2D position)
+
+  d_horizontal = √(d_slant² - Δz²)
 ```
 
 where Δz = 25 cm (anchor antenna at ~10 in) − 5 cm (tag at ~2 in) = 20 cm. Without this correction, ranges are systematically too large and the position drifts outward.
