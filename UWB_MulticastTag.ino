@@ -210,6 +210,16 @@ void setup() {
     char name[16];
     snprintf(name, sizeof(name), "UWB-T%d", TAG_ID);
     BLE.setLocalName(name);
+
+    // Advertise immediately with zeroed position so scanners can
+    // discover the tag while UWB sessions are still starting up.
+    uint8_t initMfg[7] = { 0xFF, 0xFF, (uint8_t)TAG_ID, 0, 0, 0, 0 };
+    BLEAdvertisingData initAdv;
+    initAdv.setManufacturerData(initMfg, sizeof(initMfg));
+    initAdv.setLocalName(name);
+    BLE.setAdvertisingData(initAdv);
+    BLE.advertise();
+
     Serial.print("BLE: advertising as ");
     Serial.println(name);
   }
