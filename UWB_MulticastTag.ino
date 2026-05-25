@@ -42,6 +42,7 @@
 
 // ===================== CHANGE THESE ==================================
 #define TAG_ID            1        // 1 through 12
+#define SERIAL_DEBUG      0        // 1 = verbose serial output, 0 = silent (saves power)
 // =====================================================================
 
 #define NUM_ANCHORS     4
@@ -50,6 +51,7 @@
 
 #define STALE_TIMEOUT_MS  2500
 #define INVALID_DIST      0xFFFF
+#define BLE_UPDATE_MIN_MS 100
 
 // -- State ------------------------------------------------------------
 
@@ -64,19 +66,24 @@ struct AnchorRange {
 static AnchorRange ranges[NUM_ANCHORS];
 static uint16_t prevBle[NUM_ANCHORS];
 
+static volatile uint32_t rangingCount = 0;
+static uint32_t bleAdvCount = 0;
+static uint32_t bleSkipThrottle = 0;
+static uint32_t bleSkipNoChange = 0;
+
 // -- BLE advertising --------------------------------------------------
 
 static void updateBLEAdvertising() {
+  static unsigned long lastBleUpdate = 0;
+  if (millis() - lastBleUpdate < BLE_UPDATE_MIN_MS) { bleSkipThrottle++; return; }
+
+  lastBleUpdate = millis();
+
   uint16_t cur[NUM_ANCHORS];
   for (int a = 0; a < NUM_ANCHORS; a++)
     cur[a] = ranges[a].valid ? ranges[a].distance_cm : INVALID_DIST;
 
-  bool changed = false;
-  for (int a = 0; a < NUM_ANCHORS; a++) {
-    if (cur[a] != prevBle[a]) { changed = true; break; }
-  }
-  if (!changed) return;
-
+  BLE.poll();
   BLE.stopAdvertise();
 
   uint8_t mfgData[11];
@@ -97,6 +104,8 @@ static void updateBLEAdvertising() {
 
   BLE.setAdvertisingData(advData);
   BLE.advertise();
+  bleAdvCount++;
+  delay(10);
 
   for (int a = 0; a < NUM_ANCHORS; a++)
     prevBle[a] = cur[a];
@@ -123,6 +132,7 @@ void rangingHandler(UWBRangingData &rangingData) {
       ranges[anchorId].timestamp   = millis();
     }
   }
+  rangingCount++;
 }
 
 // -- Setup ------------------------------------------------------------
@@ -153,8 +163,6 @@ void setup() {
   uint8_t tagAddrBytes[] = { 0x00, (uint8_t)TAG_ID };
   UWBMacAddress tagMac(UWBMacAddress::Size::SHORT, tagAddrBytes);
 
-  UWB.registerRangingCallback(rangingHandler);
-
   UWB.begin();
   delay(1000);
   Serial.println("=========================================");
@@ -181,13 +189,14 @@ void setup() {
     prevBle[a]            = INVALID_DIST;
   }
 
+  // Phase 1: create and register all sessions (no SPI ranging traffic yet)
   for (int a = 0; a < NUM_ANCHORS; a++) {
     uint8_t anchorAddrBytes[] = { 0xA0, (uint8_t)a };
     UWBMacAddress anchorMac(UWBMacAddress::Size::SHORT, anchorAddrBytes);
 
     uint32_t sessionId = (uint32_t)(a * 100 + GROUP_INDEX + 1);
 
-    Serial.print("  Joining session ");
+    Serial.print("  Creating session ");
     Serial.print(sessionId);
     Serial.print("  ->  Anchor A");
     Serial.print(a);
@@ -196,14 +205,21 @@ void setup() {
     Serial.println("})");
 
     sessions[a] = new MulticastResponder(sessionId, tagMac, anchorMac);
-
     UWBSessionManager.addSession(*sessions[a]);
-    delay(100);
-    sessions[a]->init();
-    delay(100);
-    sessions[a]->start();
-    delay(100);
+    delay(200);
   }
+
+  // Phase 2: init and start each session sequentially
+  for (int a = 0; a < NUM_ANCHORS; a++) {
+    Serial.print("  Starting session A");
+    Serial.println(a);
+    sessions[a]->init();
+    delay(200);
+    sessions[a]->start();
+    delay(200);
+  }
+
+  UWB.registerRangingCallback(rangingHandler);
 
   Serial.println("-----------------------------------------");
   Serial.println("All responder sessions active.");
@@ -213,8 +229,6 @@ void setup() {
 // -- Loop -------------------------------------------------------------
 
 void loop() {
-  BLE.poll();
-
   for (int a = 0; a < NUM_ANCHORS; a++) {
     if (ranges[a].valid && (millis() - ranges[a].timestamp > STALE_TIMEOUT_MS))
       ranges[a].valid = false;
@@ -222,6 +236,25 @@ void loop() {
 
   updateBLEAdvertising();
 
+  static unsigned long lastStats = 0;
+  if (millis() - lastStats >= 5000) {
+    float elapsed = (millis() - lastStats) / 1000.0;
+    Serial.print("STATS | ranging=");
+    Serial.print(rangingCount / elapsed, 1);
+    Serial.print("/s  bleAdv=");
+    Serial.print(bleAdvCount / elapsed, 1);
+    Serial.print("/s  skipThrottle=");
+    Serial.print(bleSkipThrottle);
+    Serial.print("  skipNoChange=");
+    Serial.println(bleSkipNoChange);
+    rangingCount = 0;
+    bleAdvCount = 0;
+    bleSkipThrottle = 0;
+    bleSkipNoChange = 0;
+    lastStats = millis();
+  }
+
+#if SERIAL_DEBUG
   Serial.print("T");
   Serial.print(TAG_ID);
   Serial.print(" | ");
@@ -246,6 +279,7 @@ void loop() {
   Serial.print("/4]");
 
   Serial.println();
+#endif
 
-  delay(10);
+  delay(100);
 }
